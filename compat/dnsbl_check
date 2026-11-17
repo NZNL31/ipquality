@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""并发执行 DNSBL 反查，输出：total clean other blacklisted
+
+用法: dnsbl_check <IPv4> <黑名单域名列表文件> <并发数>
+
+替代脚本原本的 `xargs -P 50 bash -c "dig ..."` 链路：
+Git Bash 在高并发 fork 下会僵死，这里改为单进程线程池。
+"""
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+import dns.resolver
+
+
+def load_nameservers():
+    import json
+
+    cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ns_cache.json")
+    try:
+        with open(cache, "r", encoding="utf-8") as fh:
+            ns = json.load(fh).get("ns")
+            if ns:
+                return ns
+    except Exception:
+        pass
+    try:
+        return list(dns.resolver.Resolver().nameservers)
+    except Exception:
+        return ["223.5.5.5"]
+
+
+NAMESERVERS = load_nameservers()
+
+
+def classify(query_name):
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = NAMESERVERS
+    resolver.timeout = 1.5
+    resolver.lifetime = 3.0
+    resolver.retry_servfail = False
+    try:
+        answer = resolver.resolve(query_name, "A", raise_on_no_answer=False)
+        if answer.rrset is None:
+            return "clean"
+        addresses = [rr.address for rr in answer]
+    except Exception:
+        # NXDOMAIN / 超时 / 拒答，均按“未列入”处理
+        return "clean"
+    if not addresses:
+        return "clean"
+    if "127.0.0.2" in addresses:
+        return "blacklisted"
+    if all(a.startswith("127.255.255.") for a in addresses):
+        return "clean"
+    return "other"
+
+
+def main(argv):
+    if len(argv) < 3:
+        sys.stderr.write("usage: dnsbl_check <ipv4> <listfile> <jobs>\n")
+        return 2
+    ip, listfile, jobs = argv[0], argv[1], int(argv[2])
+    reversed_ip = ".".join(reversed(ip.split(".")))
+
+    with open(listfile, "r", encoding="utf-8", errors="replace") as fh:
+        zones = sorted({
+            line.strip()
+            for line in fh
+            if line.strip() and not line.strip().startswith("#")
+        })
+
+    total = clean = other = blacklisted = 0
+    workers = max(4, min(jobs or 20, 64))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for verdict in pool.map(lambda z: classify("%s.%s" % (reversed_ip, z)), zones):
+            total += 1
+            if verdict == "clean":
+                clean += 1
+            elif verdict == "blacklisted":
+                blacklisted += 1
+            else:
+                other += 1
+
+    sys.stdout.write("%d %d %d %d\n" % (total, clean, other, blacklisted))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

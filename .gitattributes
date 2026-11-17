@@ -1,0 +1,18 @@
+* text=auto
+
+# POSIX shell / Python must stay LF
+*.sh        text eol=lf
+*.py        text eol=lf
+compat/bc   text eol=lf
+compat/dig  text eol=lf
+compat/nc   text eol=lf
+compat/ss   text eol=lf
+compat/dnsbl_check text eol=lf
+compat/ip_lookup   text eol=lf
+dnsbl.list  text eol=lf
+
+# Windows launchers
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+*.exe       binary

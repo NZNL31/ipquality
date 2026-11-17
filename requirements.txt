@@ -1,0 +1,6 @@
+# 可选依赖：主体的 ip_lookup 只需要 dnspython
+dnspython>=2.6
+
+# 批量流水线（audit/）用到的
+pyyaml>=6.0
+openpyxl>=3.1

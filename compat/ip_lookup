@@ -1,0 +1,1336 @@
+#!/usr/bin/env python3
+"""查询任意指定 IP 的归属与信誉（不依赖本机出口，也不需要代理、不需要 TUN）。
+
+用法: ip_lookup <IP> [--via socks5://127.0.0.1:10808] [--no-dnsbl] [--json] [--brief] [--keys]
+
+多库交叉比对，复刻 IPQuality 官方脚本的风险判定矩阵：
+  无需 key  ip2location / ip-api.com / proxycheck.io / Scamalytics / GreyNoise
+  需要 key  ipqualityscore / abuseipdb / virustotal / ipdata / ipregistry
+            写在 compat/.keys.env（自动加载），或设为环境变量：
+              IPQS_KEY / ABUSEIPDB_KEY / VIRUSTOTAL_KEY / IPDATA_KEY / IPREGISTRY_KEY
+
+威胁情报（记录事实型）：Shodan InternetDB / blocklist.de / StopForumSpam /
+  SANS ISC / AlienVault OTX / VirusTotal
+
+名单比对：
+  · DNSBL  官方 IPQuality 的 423 条库，本地并发反查（仅 IPv4，--no-dnsbl 跳过）
+  · CIDR   10 个静态名单，本地缓存 12 小时（Spamhaus DROP、IPsum、ET Compromised、
+           CINS Army、Binary Defense、DShield、FireHOL L1、X4BNet VPN/DC、Tor 出口）
+
+评分（compat/ipscore.py）：6 维加权扣分制，满分 100，每笔扣分都标注依据
+  恶意与滥用 25 · 匿名代理 25 · 基础设施 18 · 主动行为 14 · 名单收录 12 · 邮件信誉 6
+
+平台视角（compat/iprisk.py）：把同一份证据投射到 10 个主流平台的风控规则上
+  Google / Cloudflare / 电商 / 支付 / 流媒体 / 社交 / 邮件 / 游戏 / 广告 / AI
+  输出「通过·观察·挑战·拒绝」四档 + 信任分。平台没有公开查询接口，
+  这是按各自敏感项做的推断，不是平台内部评分。
+"""
+import json
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+import dns.resolver
+import ipprobe
+import iprisk
+import ipscore
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DNSBL_LIST = os.path.join(tempfile.gettempdir(), "dnsbl.list")
+DNSBL_URL = "https://raw.githubusercontent.com/xykt/IPQuality/main/ref/dnsbl.list"
+DROP_LIST = os.path.join(tempfile.gettempdir(), "spamhaus_drop.txt")
+DROP_URL = "https://www.spamhaus.org/drop/drop.txt"
+LIST_TTL = 86400
+
+# 静态 CIDR / IP 名单：名称, 下载地址, 格式, 类别
+#   格式 ip      每行一个 IP（可带注释）
+#        cidr    每行 IP 或 CIDR，分号后为注释
+#        score   "IP<TAB>收录库数"，只取 >= IPSUM_MIN
+#        dshield "起始IP 结束IP 掩码"
+#   类别 blacklist 恶意/滥用 ｜ proxy 代理VPN ｜ tor Tor出口 ｜ cloud 机房
+BL_DIR = os.path.join(tempfile.gettempdir(), "ipq_blocks")
+BL_TTL = 43200
+IPSUM_MIN = 3
+BL_LISTS = [
+    ("Spamhaus DROP", "https://www.spamhaus.org/drop/drop.txt", "cidr", "blacklist"),
+    ("IPsum", "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt", "score", "blacklist"),
+    ("ET Compromised", "https://rules.emergingthreats.net/blockrules/compromised-ips.txt", "ip", "blacklist"),
+    ("CINS Army", "https://cinsscore.com/list/ci-badguys.txt", "ip", "blacklist"),
+    ("Binary Defense", "https://www.binarydefense.com/banlist.txt", "ip", "blacklist"),
+    ("DShield", "https://feeds.dshield.org/block.txt", "dshield", "blacklist"),
+    ("FireHOL L1", "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset", "cidr", "blacklist"),
+    ("X4BNet VPN", "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/vpn/ipv4.txt", "cidr", "proxy"),
+    ("X4BNet DC", "https://raw.githubusercontent.com/X4BNet/lists_vpn/main/output/datacenter/ipv4.txt", "cidr", "cloud"),
+    ("Tor Exit", "https://raw.githubusercontent.com/SecOps-Institute/Tor-IP-Addresses/master/tor-exit-nodes.lst", "ip", "tor"),
+]
+
+
+def load_keyfile():
+    """从 compat/.keys.env 读取 KEY=VALUE，已存在的环境变量优先。"""
+    path = os.path.join(HERE, ".keys.env")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+
+
+load_keyfile()
+
+KEYS = {
+    "ipqualityscore": os.environ.get("IPQS_KEY", "").strip(),
+    "abuseipdb": os.environ.get("ABUSEIPDB_KEY", "").strip(),
+    "virustotal": os.environ.get("VIRUSTOTAL_KEY", "").strip(),
+    "ipdata": os.environ.get("IPDATA_KEY", "").strip(),
+    "ipregistry": os.environ.get("IPREGISTRY_KEY", "").strip(),
+}
+
+
+# ---------------------------------------------------------------- HTTP helpers
+def fetch(url, timeout=12, headers=None):
+    cmd = ["curl", "-sSL", "--max-time", str(timeout)]
+    for k, v in (headers or {}).items():
+        cmd += ["-H", "%s: %s" % (k, v)]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace", timeout=timeout + 5)
+        return proc.stdout or ""
+    except Exception:
+        return ""
+
+
+def fetch_json(url, timeout=12, headers=None):
+    try:
+        return json.loads(fetch(url, timeout, headers))
+    except Exception:
+        return {}
+
+
+def yn(value):
+    """把各种 yes/no、true/false 归一成 True/False/None。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("yes", "true", "y"):
+            return True
+        if low in ("no", "false", "n"):
+            return False
+    return None
+
+
+# 不可公网路由的地址段。不用 ipaddress 的 is_private/is_reserved 判断，
+# 因为这几个属性在不同 Python 版本里语义变过（100.64/10 尤甚），
+# 显式列表才能保证跨版本行为一致。
+_SPECIAL_NETS = [
+    ("0.0.0.0/8", "未指定地址段（0.0.0.0/8），无实际含义"),
+    ("10.0.0.0/8", "私有地址（RFC1918），仅内网可达"),
+    ("100.64.0.0/10", "运营商级 NAT 共享地址（CGNAT），公网无信誉记录"),
+    ("127.0.0.0/8", "环回地址（127.0.0.0/8），只在本机内部有意义"),
+    ("169.254.0.0/16", "链路本地地址（169.254.0.0/16），不经过公网"),
+    ("172.16.0.0/12", "私有地址（RFC1918），仅内网可达"),
+    ("192.0.0.0/24", "IETF 协议分配段，不可公网路由"),
+    ("192.0.2.0/24", "文档示例段（TEST-NET-1），不可公网路由"),
+    ("192.168.0.0/16", "私有地址（RFC1918），仅内网可达"),
+    ("198.18.0.0/15", "网络基准测试段，不可公网路由"),
+    ("198.51.100.0/24", "文档示例段（TEST-NET-2），不可公网路由"),
+    ("203.0.113.0/24", "文档示例段（TEST-NET-3），不可公网路由"),
+    ("224.0.0.0/4", "组播地址，不用于主机寻址"),
+    ("240.0.0.0/4", "保留地址段（含广播地址），不可公网路由"),
+]
+_SPECIAL = [(ipaddress.ip_network(n), msg) for n, msg in _SPECIAL_NETS]
+
+
+def _special_scope(ip):
+    """私有/保留地址没有公网信誉。给它打分只会误导，必须显式拒绝。"""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return "不是合法的 IP 地址（IPv4 形如 1.2.3.4，IPv6 含冒号）"
+    for net, msg in _SPECIAL:
+        if a.version == net.version and a in net:
+            return msg
+    return None
+
+
+def tri(value):
+    if value is None:
+        return "—"
+    return "是" if value else "否"
+
+
+def wlen(text):
+    """按终端显示宽度算长度：中日韩全角字符占 2 列。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1
+               for c in str(text))
+
+
+def pad(text, width, align="<"):
+    """按显示宽度补齐，保证中英混排的表格列对齐。"""
+    text = str(text)
+    gap = width - wlen(text)
+    if gap <= 0:
+        return text
+    return text + " " * gap if align == "<" else " " * gap + text
+
+
+# ---------------------------------------------------------------- DNSBL
+def nameservers():
+    try:
+        with open(os.path.join(HERE, ".ns_cache.json"), "r", encoding="utf-8") as fh:
+            ns = json.load(fh).get("ns")
+            if ns:
+                return ns
+    except Exception:
+        pass
+    try:
+        return list(dns.resolver.Resolver().nameservers)
+    except Exception:
+        return ["223.5.5.5"]
+
+
+NS = nameservers()
+
+
+def load_zones():
+    fresh = False
+    if os.path.exists(DNSBL_LIST):
+        fresh = time.time() - os.path.getmtime(DNSBL_LIST) < LIST_TTL
+    if not fresh:
+        text = fetch(DNSBL_URL, 20)
+        zones = sorted({line.strip() for line in text.splitlines()
+                        if line.strip() and not line.strip().startswith("#")})
+        if zones:
+            try:
+                with open(DNSBL_LIST, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(zones) + "\n")
+            except Exception:
+                pass
+            return zones
+    try:
+        with open(DNSBL_LIST, "r", encoding="utf-8", errors="replace") as fh:
+            return sorted({line.strip() for line in fh if line.strip()})
+    except Exception:
+        return []
+
+
+def classify(job):
+    zone, query_name = job
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = NS
+    resolver.timeout = 1.5
+    resolver.lifetime = 3.0
+    resolver.retry_servfail = False
+    try:
+        answer = resolver.resolve(query_name, "A", raise_on_no_answer=False)
+        if answer.rrset is None:
+            return zone, "clean", None
+        addresses = [rr.address for rr in answer]
+    except Exception:
+        return zone, "clean", None
+    if not addresses:
+        return zone, "clean", None
+    if "127.0.0.2" in addresses:
+        return zone, "blacklisted", addresses
+    if all(a.startswith("127.255.255.") for a in addresses):
+        return zone, "clean", None
+    return zone, "other", addresses
+
+
+SENTINELS = ("8.8.8.8", "1.1.1.1")
+
+
+def zone_untrusted(zone):
+    """该库若对公认干净的公共 DNS 也报黑名单，说明应答不可信（需注册/配置错误）。"""
+    for sentinel in SENTINELS:
+        rev = ".".join(reversed(sentinel.split(".")))
+        verdict = classify((zone, "%s.%s" % (rev, zone)))[1]
+        if verdict != "clean":
+            return True
+    return False
+
+
+def dnsbl_report(ip, zones, jobs=40):
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    result = {"total": 0, "clean": 0, "other": 0, "blacklisted": 0,
+              "suspect": 0, "hits": []}
+    jobs_list = [(z, "%s.%s" % (reversed_ip, z)) for z in zones]
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for zone, verdict, addrs in pool.map(classify, jobs_list):
+            result["total"] += 1
+            result[verdict] += 1
+            if verdict != "clean":
+                result["hits"].append({"zone": zone, "verdict": verdict,
+                                       "answer": addrs or []})
+    result["hits"].sort(key=lambda h: (h["verdict"] != "blacklisted", h["zone"]))
+    # 复核：命中即意味着「该库把这个 IP 列进去了」。
+    # 但部分库（需注册的、或分区配置错误的）对所有查询都返回 127.0.0.2，
+    # 用两个公认干净的 IP 反查一次即可识别这类误报。
+    if result["hits"]:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for hit in result["hits"]:
+                hit["suspect"] = pool.submit(zone_untrusted, hit["zone"]).result()
+        for hit in result["hits"]:
+            if hit.get("suspect"):
+                result[hit["verdict"]] -= 1
+                result["suspect"] += 1
+    return result
+
+
+# ---------------------------------------------------------------- data sources
+def src_ip2location(ip):
+    d = fetch_json("https://api.ip2location.io/?ip=%s" % ip)
+    if not d or d.get("error"):
+        return None
+    return {
+        "name": "IP2Location",
+        "proxy": yn(d.get("is_proxy")),
+        "vpn": None, "tor": None, "hosting": None, "mobile": None,
+        "score": None,
+        "_geo": (d.get("country_code"), d.get("region_name"), d.get("city_name")),
+        "_org": d.get("as"),
+    }
+
+
+def src_ipapi_com(ip):
+    d = fetch_json("http://ip-api.com/json/%s?fields=status,country,regionName,"
+                   "city,isp,org,as,proxy,hosting,mobile,reverse" % ip)
+    if not d or d.get("status") != "success":
+        return None
+    return {
+        "name": "ip-api.com",
+        "proxy": yn(d.get("proxy")),
+        "vpn": None, "tor": None,
+        "hosting": yn(d.get("hosting")),
+        "mobile": yn(d.get("mobile")),
+        "score": None,
+        "_geo": (d.get("country"), d.get("regionName"), d.get("city")),
+        "_org": d.get("as") or d.get("isp"),
+        "_ptr": d.get("reverse") or None,
+    }
+
+
+def src_proxycheck(ip):
+    d = fetch_json("https://proxycheck.io/v2/%s?vpn=1&asn=1" % ip, 15)
+    if not d or d.get("status") != "ok":
+        return {"name": "proxycheck.io", "proxy": None, "vpn": None, "tor": None,
+                "hosting": None, "mobile": None, "score": None,
+                "_err": (d.get("message") or "限额/不可用") if d else "不可用"}
+    node = d.get(ip) or next((v for k, v in d.items()
+                              if isinstance(v, dict) and k != "status"), {})
+    ptype = (node.get("type") or "").strip()
+    ptype_raw = ptype
+    if ptype.lower() in ("residential", "business", ""):
+        ptype = ""
+    return {
+        "name": "proxycheck.io",
+        "proxy": yn(node.get("proxy")),
+        "vpn": None, "tor": None,
+        "hosting": None, "mobile": None,
+        "score": None,
+        "_rtype": ptype,
+        "_ptype": ptype_raw,
+        "_geo": (node.get("country"), node.get("region"), node.get("city")),
+        "_org": node.get("organisation") or node.get("provider"),
+    }
+
+
+def src_scamalytics(ip):
+    html = fetch("https://scamalytics.com/ip/%s" % ip, 18)
+    if not html or "Fraud Score" not in html:
+        return None
+    m = re.search(r"Fraud Score[^0-9]{0,60}(\d{1,3})", html)
+    score = int(m.group(1)) if m else None
+    proxy = None
+    mp = re.search(r"Anonymous Proxy[^A-Za-z]{0,20}(Yes|No)", html, re.I)
+    if mp:
+        proxy = mp.group(1).lower() == "yes"
+    tor = None
+    mt = re.search(r"Tor Exit Node[^A-Za-z]{0,20}(Yes|No)", html, re.I)
+    if mt:
+        tor = mt.group(1).lower() == "yes"
+    return {"name": "Scamalytics", "proxy": proxy, "vpn": None, "tor": tor,
+            "hosting": None, "mobile": None, "score": score}
+
+
+GN_CACHE = os.path.join(tempfile.gettempdir(), "ipq_greynoise.json")
+GN_TTL = 86400
+
+
+def _gn_cache(read=True, data=None):
+    if read:
+        try:
+            with open(GN_CACHE, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+    try:
+        with open(GN_CACHE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass
+    return None
+
+
+def src_greynoise(ip):
+    """GreyNoise Community：免费无 key，反映「是否被观测到主动扫描」。
+
+    免 key 额度是 25 次/周，很容易打满，所以成功结果缓存 24 小时，
+    避免重复查询同一个 IP 反复消耗配额。
+    """
+    cache = _gn_cache()
+    entry = cache.get(ip)
+    d = None
+    if entry and time.time() - entry.get("t", 0) < GN_TTL:
+        d = entry.get("d") or {}
+    else:
+        d = fetch_json("https://api.greynoise.io/v3/community/%s" % ip, 15)
+        if d and "message" not in d:
+            cache[ip] = {"t": time.time(), "d": d}
+            _gn_cache(read=False, data=cache)
+        elif d and "message" in d:
+            return {"name": "GreyNoise", "proxy": None, "vpn": None, "tor": None,
+                    "hosting": None, "mobile": None, "score": None,
+                    "_err": "免费额度 25 次/周已用尽"}
+    if not d:
+        return {"name": "GreyNoise", "proxy": None, "vpn": None, "tor": None,
+                "hosting": None, "mobile": None, "score": None,
+                "_err": "接口无响应"}
+    return {
+        "name": "GreyNoise", "proxy": None, "vpn": None, "tor": None,
+        "hosting": None, "mobile": None, "score": None,
+        "_noise": d.get("noise"), "_riot": d.get("riot"),
+        "_class": d.get("classification"), "_last": d.get("last_seen"),
+    }
+
+
+def check_drop(ip):
+    """Spamhaus DROP：被劫持/攻击用途的网段清单，本地匹配。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except Exception:
+        return "skip", None
+    if addr.version != 4:
+        return "skip", None
+    need_fetch = True
+    if os.path.exists(DROP_LIST) and time.time() - os.path.getmtime(DROP_LIST) < LIST_TTL:
+        need_fetch = False
+    if need_fetch:
+        text = fetch(DROP_URL, 20)
+        if text and "/" in text:
+            try:
+                with open(DROP_LIST, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            except Exception:
+                pass
+    try:
+        with open(DROP_LIST, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except Exception:
+        return "unavailable", None
+    if "/" not in content:
+        return "unavailable", None
+    for line in content.splitlines():
+        cidr = line.split(";")[0].strip()
+        if "/" not in cidr:
+            continue
+        try:
+            if addr in ipaddress.ip_network(cidr, strict=False):
+                return "hit", cidr
+        except Exception:
+            continue
+    return "clean", None
+
+
+def parse_block(fmt, text):
+    """把名单文本解析成 (精确IP集合, v4网段列表, v6网段列表, 附加信息)。"""
+    exact, nets, meta = set(), [], {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        if fmt == "score":
+            parts = line.replace("\t", " ").split()
+            if len(parts) < 2:
+                continue
+            try:
+                score = int(parts[1])
+            except Exception:
+                continue
+            if score < IPSUM_MIN:
+                continue
+            exact.add(parts[0])
+            meta[parts[0]] = score
+            continue
+        if fmt == "dshield":
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                nets.append(ipaddress.ip_network("%s/%s" % (parts[0], parts[2]),
+                                                 strict=False))
+            except Exception:
+                pass
+            continue
+        token = line.split(";")[0].strip()
+        if not token:
+            continue
+        token = token.split()[0]
+        if "/" in token:
+            try:
+                nets.append(ipaddress.ip_network(token, strict=False))
+            except Exception:
+                pass
+        else:
+            try:
+                ipaddress.ip_address(token)
+            except Exception:
+                continue
+            exact.add(token)
+    v4, v6 = [], []
+    for net in nets:
+        (v4 if net.version == 4 else v6).append(net)
+    return exact, v4, v6, meta
+
+
+def load_block(name, url, fmt):
+    """带 12 小时本地缓存的名单加载；失败返回 None。"""
+    if not os.path.isdir(BL_DIR):
+        try:
+            os.makedirs(BL_DIR)
+        except Exception:
+            pass
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+    path = os.path.join(BL_DIR, "%s.json" % safe)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < BL_TTL:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+            return (set(d.get("exact") or []),
+                    [ipaddress.ip_network(n) for n in d.get("v4") or []],
+                    [ipaddress.ip_network(n) for n in d.get("v6") or []],
+                    d.get("meta") or {})
+        except Exception:
+            pass
+    text = fetch(url, 35)
+    if not text.strip():
+        return None
+    exact, v4, v6, meta = parse_block(fmt, text)
+    if not exact and not v4 and not v6:
+        return None
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"exact": sorted(exact),
+                       "v4": [str(n) for n in v4],
+                       "v6": [str(n) for n in v6],
+                       "meta": meta}, fh)
+    except Exception:
+        pass
+    return exact, v4, v6, meta
+
+
+def probe_block(entry, ip_str, addr):
+    name, url, fmt, cat = entry
+    loaded = load_block(name, url, fmt)
+    if not loaded:
+        return {"name": name, "cat": cat, "state": "unavailable"}
+    exact, v4, v6, meta = loaded
+    if ip_str in exact:
+        return {"name": name, "cat": cat, "state": "hit",
+                "detail": meta.get(ip_str), "kind": "精确 IP"}
+    nets = v4 if addr.version == 4 else v6
+    for net in nets:
+        if addr in net:
+            return {"name": name, "cat": cat, "state": "hit",
+                    "detail": str(net), "kind": "网段"}
+    return {"name": name, "cat": cat, "state": "clean"}
+
+
+def scan_blocks(ip, jobs=8):
+    """并发匹配全部静态名单。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except Exception:
+        return []
+    ip_str = str(addr)
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = list(pool.map(lambda e: probe_block(e, ip_str, addr), BL_LISTS))
+    return results
+
+
+PROXY_PORTS = {1080, 1081, 3128, 8080, 8118, 8888, 8388, 9050, 9150, 7890, 7891}
+def intel_shodan(ip):
+    raw = fetch("https://internetdb.shodan.io/%s" % ip, 15)
+    if not raw.strip():
+        return {"name": "Shodan", "note": "请求失败"}
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return {"name": "Shodan", "note": "响应异常"}
+    if d.get("detail"):
+        return {"name": "Shodan", "note": "无扫描记录（未索引到开放服务）"}
+    ports = d.get("ports") or []
+    tags = [t for t in (d.get("tags") or []) if t]
+    vulns = d.get("vulns") or []
+    bad = [p for p in ports if p in PROXY_PORTS]
+    warn = bool(bad) or bool(set(tags) & {"vpn", "tor", "proxy"}) or bool(vulns)
+    bits = ["端口 %s" % (",".join(map(str, ports)) if ports else "无")]
+    if tags:
+        bits.append("标签 %s" % ",".join(tags))
+    if bad:
+        bits.append("⚠含代理常见端口 %s" % ",".join(map(str, bad)))
+    if vulns:
+        bits.append("⚠漏洞 %d 个" % len(vulns))
+    return {"name": "Shodan", "note": " | ".join(bits), "warn": warn,
+            "_ports": ports, "_tags": tags, "_vulns": vulns}
+
+
+def intel_blocklistde(ip):
+    d = fetch_json("https://api.blocklist.de/api.php?ip=%s&format=json" % ip, 15)
+    if not isinstance(d, dict) or "attacks" not in d:
+        return {"name": "blocklist.de", "note": "无响应"}
+    attacks = int(d.get("attacks") or 0)
+    reports = int(d.get("reports") or 0)
+    return {"name": "blocklist.de",
+            "note": "攻击 %d 次 | 上报者 %d 人" % (attacks, reports),
+            "warn": attacks > 0, "_attacks": attacks, "_reports": reports}
+
+
+def intel_stopforumspam(ip):
+    d = fetch_json("https://api.stopforumspam.org/api?ip=%s&json" % ip, 15)
+    node = (d or {}).get("ip") or {}
+    if not node:
+        return {"name": "StopForumSpam", "note": "无响应"}
+    freq = int(node.get("frequency") or 0)
+    appears = int(node.get("appears") or 0)
+    return {"name": "StopForumSpam",
+            "note": "垃圾邮件出现 %d 次 | 频率 %d" % (appears, freq),
+            "warn": appears > 0 or freq > 0,
+            "_appears": appears, "_freq": freq}
+
+
+def intel_sans(ip):
+    d = fetch_json("https://isc.sans.edu/api/ip/%s?json" % ip, 15)
+    node = (d or {}).get("ip") or {}
+    if not node:
+        return {"name": "SANS ISC", "note": "无响应"}
+    count = node.get("count")
+    attacks = node.get("attacks")
+    abuse = node.get("asabusecontact")
+    bits = ["扫描目标 %s | 攻击 %s" % (count if count is not None else 0,
+                                     attacks if attacks is not None else 0)]
+    if abuse:
+        bits.append("滥用联系 %s" % abuse)
+    return {"name": "SANS ISC", "note": " | ".join(bits),
+            "warn": bool(count or attacks),
+            "_count": int(count or 0), "_attacks": int(attacks or 0)}
+
+
+def intel_otx(ip):
+    d = fetch_json("https://otx.alienvault.com/api/v1/indicators/IPv4/%s/general"
+                   % ip, 15)
+    if not isinstance(d, dict) or "pulse_info" not in d:
+        return {"name": "AlienVault OTX", "note": "无响应"}
+    pulses = (d.get("pulse_info") or {}).get("count") or 0
+    rep = d.get("reputation")
+    return {"name": "AlienVault OTX",
+            "note": "情报 %d 条 | 社区评分 %s" % (pulses, rep),
+            "warn": bool(pulses), "_pulses": int(pulses), "_rep": rep}
+
+
+def intel_virustotal(ip):
+    """VirusTotal：90+ 引擎判定 + 社区信誉（需 key，免费 500 次/天、4 次/分）。"""
+    key = KEYS["virustotal"]
+    if not key:
+        return None
+    d = fetch_json("https://www.virustotal.com/api/v3/ip_addresses/%s" % ip, 25,
+                   {"x-apikey": key})
+    if d.get("error"):
+        code = (d.get("error") or {}).get("code") or "错误"
+        return {"name": "VirusTotal", "note": "查询失败（%s）" % code}
+    attrs = (d.get("data") or {}).get("attributes") or {}
+    if not attrs:
+        return {"name": "VirusTotal", "note": "无响应"}
+    stats = attrs.get("last_analysis_stats") or {}
+    mal = int(stats.get("malicious") or 0)
+    sus = int(stats.get("suspicious") or 0)
+    total = sum(int(v or 0) for v in stats.values()) or 0
+    rep = attrs.get("reputation")
+    bits = ["恶意 %d/%d 引擎" % (mal, total)]
+    if sus:
+        bits.append("可疑 %d" % sus)
+    bits.append("信誉 %s" % ("—" if rep is None else rep))
+    flagged = sorted(n for n, r in (attrs.get("last_analysis_results") or {}).items()
+                     if r.get("category") in ("malicious", "suspicious"))
+    if flagged:
+        bits.append("检出 %s%s" % (",".join(flagged[:5]),
+                                   "" if len(flagged) <= 5 else " 等"))
+    tags = [t for t in (attrs.get("tags") or []) if t and not t.isdigit()]
+    if tags:
+        bits.append("标签 %s" % ",".join(tags[:5]))
+    owner = (attrs.get("as_owner") or "").strip()
+    if owner:
+        bits.append("AS %s %s" % (attrs.get("asn") or "", owner))
+    return {"name": "VirusTotal", "note": " | ".join(bits),
+            "warn": mal > 0 or sus > 0, "_tags": [t.lower() for t in tags],
+            "_mal": mal, "_sus": sus, "_total": total, "_rep": rep}
+
+
+def intel_pdns(ip):
+    """被动 DNS：这个出口近期承载了多少域名 —— 共享度，滥用风险的关键变量。
+
+    独享出口的信誉只由自己的行为决定；高密度共享出口则一损俱损，
+    同一出口上任何一个域名作恶，整段出口的风控评级都会被拖低。
+    数据来自 VirusTotal resolutions（meta.count 为累计总数，
+    免费层每次最多返回 40 条，recent 只能按返回样本统计）。
+    """
+    key = KEYS["virustotal"]
+    if not key:
+        return None
+    d = fetch_json(
+        "https://www.virustotal.com/api/v3/ip_addresses/%s/resolutions?limit=40"
+        % ip, 25, {"x-apikey": key})
+    if d.get("error"):
+        code = (d.get("error") or {}).get("code") or "错误"
+        return {"name": "PassiveDNS", "note": "查询失败（%s）" % code}
+    total_all = int((d.get("meta") or {}).get("count") or 0)
+    items = d.get("data") or []
+    now = time.time()
+    recent = 0
+    mal_hosts = []
+    hosts = []
+    for it in items:
+        a = it.get("attributes") or {}
+        host = (a.get("host_name") or "").strip()
+        if not host:
+            continue
+        hosts.append(host)
+        ts = a.get("date") or 0
+        if ts and (now - ts) <= 90 * 86400:
+            recent += 1
+        st = a.get("host_name_last_analysis_stats") or {}
+        if int(st.get("malicious") or 0) > 0:
+            mal_hosts.append(host)
+    if not hosts:
+        return {"name": "PassiveDNS",
+                "note": "近 90 天没有域名解析到此（基本独享的出口）",
+                "warn": False,
+                "_recent": 0, "_total": total_all, "_hosts": [], "_mal_hosts": []}
+    bits = ["近 90 天活跃 %d 个域名" % recent]
+    if total_all > len(items):
+        bits.append("累计 %d 条（样本前 %d 条）" % (total_all, len(items)))
+    if mal_hosts:
+        bits.append("⚠ %d 个共用域名被引擎判恶意" % len(mal_hosts))
+    bits.append("例 %s" % "、".join(hosts[:3]))
+    return {"name": "PassiveDNS", "note": " | ".join(bits),
+            "warn": bool(mal_hosts) or recent >= 30,
+            "_recent": recent, "_total": total_all,
+            "_hosts": hosts, "_mal_hosts": mal_hosts}
+
+
+def src_iplocation_keyed(ip):
+    out = []
+    key = KEYS["ipqualityscore"]
+    if key:
+        d = fetch_json("https://ipqualityscore.com/api/json/ip/%s/%s"
+                       "?strictness=1" % (key, ip), 15)
+        if d and d.get("success"):
+            out.append({
+                "name": "IPQualityScore", "proxy": yn(d.get("proxy")),
+                "vpn": yn(d.get("vpn")), "tor": yn(d.get("tor")),
+                "hosting": None, "mobile": None,
+                "score": d.get("fraud_score"),
+                "_abuse": d.get("recent_abuse"),
+            })
+    key = KEYS["abuseipdb"]
+    if key:
+        d = fetch_json("https://api.abuseipdb.com/api/v2/check?ipAddress=%s"
+                       "&maxAgeInDays=90" % ip, 15,
+                       {"Key": key, "Accept": "application/json"})
+        node = (d or {}).get("data") or {}
+        if node:
+            out.append({
+                "name": "AbuseIPDB", "proxy": None, "vpn": None,
+                "tor": yn(node.get("isTor")),
+                "hosting": node.get("usageType") not in (None, "Commercial",
+                                                         "Fixed Line ISP",
+                                                         "Mobile ISP", "University"),
+                "mobile": None,
+                "score": node.get("abuseConfidenceScore"),
+                "_reports": node.get("totalReports"),
+            })
+    key = KEYS["ipdata"]
+    if key:
+        d = fetch_json("https://api.ipdata.co/%s?api-key=%s" % (ip, key), 15)
+        t = (d or {}).get("threat") or {}
+        if t:
+            out.append({
+                "name": "ipdata", "proxy": yn(t.get("is_proxy")),
+                "vpn": yn(t.get("is_vpn")), "tor": yn(t.get("is_tor")),
+                "hosting": yn(t.get("is_datacenter")), "mobile": None,
+                "score": None,
+            })
+    key = KEYS["ipregistry"]
+    if key:
+        d = fetch_json("https://api.ipregistry.co/%s?key=%s" % (ip, key), 15)
+        s = (d or {}).get("security") or {}
+        if s:
+            out.append({
+                "name": "ipregistry", "proxy": yn(s.get("is_proxy")),
+                "vpn": yn(s.get("is_vpn")), "tor": yn(s.get("is_tor")),
+                "hosting": yn(s.get("is_datacenter")), "mobile": None,
+                "score": None,
+            })
+    return out
+
+
+# ---------------------------------------------------------------- main
+def _print_score(sc):
+    """把评分结果渲染成人能一眼看懂的分块。"""
+    total = sc["score"]
+    filled = int(round(total / 5.0))
+    bar = "█" * filled + "░" * max(0, 20 - filled)
+    print()
+    print("【综合评分】 %d / 100    等级 %s · %s    置信度 %d%%"
+          % (total, sc["grade"], sc["grade_cn"], sc["confidence"]))
+    print("  " + bar)
+    print("  " + sc["verdict"])
+    if sc.get("cap"):
+        print("  （线性扣分原始值 %.1f 分，因「%s」触发上限 %d 分）"
+              % (sc["raw_score"], sc["cap_reason"], sc["cap"]))
+    print()
+    print("  " + pad("维度", 18) + pad("权重", 6, ">") + pad("得分", 6, ">")
+          + pad("扣分", 8, ">") + "  依据")
+    print("  " + "-" * 78)
+    for d in sc["dimensions"]:
+        penalty = "-%.1f" % d["penalty"] if d["penalty"] else "0.0"
+        print("  " + pad(d["name"], 18) + pad(d["weight"], 6, ">")
+              + pad("%.1f" % d["score"], 6, ">") + pad(penalty, 8, ">")
+              + "  " + d["evidence"])
+
+
+USECASE_MARK = {"yes": "✔", "warn": "⚠", "no": "✘"}
+
+VERDICT_MARK = {"通过": "✔", "观察": "◐", "挑战": "⚠", "拒绝": "✘"}
+
+
+def _print_platforms(data):
+    """渲染平台风控投射表。每行都能追到「为什么是这个档位」。"""
+    rows = data["platforms"]
+    print()
+    print("【主流平台风控视角】%d 个平台的规则投射（推断，非平台内部评分）"
+          % len(rows))
+    print("  " + pad("平台", 35) + pad("主要扣分", 11) + pad("信任分", 8, ">")
+          + "  预判")
+    print("  " + "-" * 72)
+    for r in rows:
+        print("  " + pad(r["name"], 35) + pad(r["sensitive"], 11)
+              + pad(r["trust"], 8, ">")
+              + "  %s %s" % (VERDICT_MARK.get(r["verdict"], "·"), r["verdict"]))
+    print("  " + "-" * 72)
+    blocked = [r for r in rows if r["verdict"] in ("挑战", "拒绝")]
+    if blocked:
+        grouped = {}
+        for r in blocked:
+            grouped.setdefault(r["basis"], []).append(r["name"].split("（")[0])
+        parts = []
+        for reason, names in grouped.items():
+            head = "、".join(names[:2])
+            if len(names) > 2:
+                head += " 等 %d 个" % len(names)
+            parts.append("%s（%s）" % (reason, head))
+        print("  卡点：%s" % "；".join(parts))
+    print("  最严：%s ｜ 最松：%s" % (data["strictest"], data["loosest"]))
+    print("  档位：通过 ≥85 ｜ 观察 ≥72 ｜ 挑战 ≥55 ｜ 拒绝 <55"
+          "（平台无公开查询接口，按已知敏感项加权推断）")
+
+
+def _print_usecases(rows):
+    print()
+    print("【适用性评估】同一 IP 在不同场景的容忍度完全不同")
+    for row in rows:
+        mark = USECASE_MARK.get(row["state"], "·")
+        note = row["note"]
+        print(("  %s %s%s" % (mark, pad(row["name"], 22),
+                              ("— " + note) if note else "")).rstrip())
+
+
+def _print_probe(ip, probe, platforms):
+    """实测结果 + 与推断的逐项对照。不一致比一致更有信息量。"""
+    print()
+    print("【实测验证】经 %s 出站" % probe["proxy"])
+    if probe.get("error"):
+        print("  ✘ 出口校验失败：%s" % probe["error"])
+        print("  请确认代理客户端已启动、端口正确、且开了 socks5 监听")
+        return
+    if not probe.get("match"):
+        print("  ✘ 出口 IP 是 %s，与目标 %s 不一致 —— 拒绝实测"
+              % (probe["exit_ip"], ip))
+        print("  风控只看请求从哪个 IP 来。出口不一致时，测到的是你自己的网络，")
+        print("  和这个 IP 毫无关系。请先在客户端切到该 IP 对应的节点再重跑。")
+        return
+    print("  ✔ 出口 IP %s，与目标一致" % probe["exit_ip"])
+    print()
+
+    pmap = {p["key"]: p for p in (platforms or {}).get("platforms", [])}
+    print("  " + pad("平台", 22) + pad("实测", 7) + pad("耗时", 7)
+          + pad("推断", 7) + pad("对照", 10) + "证据")
+    print("  " + "-" * 78)
+    agree = differ = 0
+    seen = set()
+    for r in probe["results"]:
+        p = pmap.get(r.get("key"))
+        guess = p["verdict"] if p else "—"
+        align = "—"
+        if p and r.get("key") in seen:
+            align = "同平台"          # 同一平台多个探针，只算一次对照
+        elif p:
+            seen.add(r.get("key"))
+            if (r["verdict"] == "通过") == (guess == "通过"):
+                align, agree = "一致", agree + 1
+            elif r["verdict"] == "通过":
+                align, differ = "推断偏严", differ + 1
+            elif guess == "通过":
+                align, differ = "推断偏松", differ + 1
+            else:
+                align, differ = "待观察", differ + 1
+        try:
+            cost = "%.1fs" % float(r["elapsed"])
+        except Exception:
+            cost = "—"
+        print("  " + pad(r["name"], 22) + pad(r["verdict"], 7) + pad(cost, 7)
+              + pad(guess, 7) + pad(align, 10) + r["evidence"])
+    print("  " + "-" * 78)
+    print("  一致 %d 项 ｜ 偏差 %d 项。风控是概率性的：单次通过不代表稳定通过，"
+          % (agree, differ))
+    print("  单次被拦也不代表永久封禁，间隔几分钟再测 2-3 次更可靠。")
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write("用法: ip_lookup <IP> [--via socks5://127.0.0.1:10808] [--no-dnsbl] [--json] [--brief] [--keys]\n")
+        return 2
+    if "--keys" in argv or "-h" in argv or "--help" in argv:
+        print("可选 API key —— 只有下面三个值得补（免费额度够用）：")
+        print("  IPQS_KEY       注册 https://www.ipqualityscore.com/create-account")
+        print("                 免费 1000 次/月（每日上限 35），含 proxy/vpn/tor/fraud_score")
+        print("                 查看 key：登录后 https://www.ipqualityscore.com/user/proxy-detection-api")
+        print("  ABUSEIPDB_KEY  注册 https://www.abuseipdb.com/register")
+        print("                 免费 1000 次/天，含 abuseConfidenceScore/totalReports/isTor")
+        print("                 查看 key：登录后 https://www.abuseipdb.com/account → API Settings")
+        print("  VIRUSTOTAL_KEY 注册 https://www.virustotal.com/gui/join-us")
+        print("                 免费 500 次/天（4 次/分），含 90+ 引擎判定/reputation/tags")
+        print("                 查看 key：登录后 https://www.virustotal.com/gui/my-apikey")
+        print()
+        print("下面两个不支持（代码里仍保留支持，但没免费额度）：")
+        print("  ipdata      免费层不含 VPN detection（需 Business $120/mo），仅 OSINT 黑名单")
+        print("  ipregistry  已取消免费层，最低 $29/mo")
+        print()
+        print("设置方式：把 KEY=VALUE 写进 compat/.keys.env（已自动加载），")
+        print("或 export IPQS_KEY=你的key ABUSEIPDB_KEY=你的key VIRUSTOTAL_KEY=你的key")
+        print("  ./compat/ip_lookup --test-keys     # 先验证 key 是否可用")
+        return 0
+
+    if "--test-keys" in argv:
+        print("API key 自检")
+        print("=" * 60)
+        probe = "126.27.114.219"
+        key = KEYS["ipqualityscore"]
+        if not key:
+            print("  IPQS_KEY       未设置")
+        else:
+            d = fetch_json("https://ipqualityscore.com/api/json/ip/%s/%s"
+                           "?strictness=1" % (key, probe), 15)
+            if d.get("success"):
+                print("  IPQS_KEY       ✅ 有效（fraud_score=%s, proxy=%s, 剩余额度见后台）"
+                      % (d.get("fraud_score"), d.get("proxy")))
+            else:
+                print("  IPQS_KEY       ❌ %s" % (d.get("message") or "无效/网络失败"))
+        key = KEYS["abuseipdb"]
+        if not key:
+            print("  ABUSEIPDB_KEY  未设置")
+        else:
+            d = fetch_json("https://api.abuseipdb.com/api/v2/check?ipAddress=%s"
+                           "&maxAgeInDays=90" % probe, 15,
+                           {"Key": key, "Accept": "application/json"})
+            node = (d or {}).get("data") or {}
+            if node:
+                print("  ABUSEIPDB_KEY  ✅ 有效（abuseConfidenceScore=%s, totalReports=%s）"
+                      % (node.get("abuseConfidenceScore"), node.get("totalReports")))
+            else:
+                err = ((d or {}).get("errors") or [{}])[0].get("detail", "无效/网络失败")
+                print("  ABUSEIPDB_KEY  ❌ %s" % err)
+        key = KEYS["virustotal"]
+        if not key:
+            print("  VIRUSTOTAL_KEY 未设置")
+        else:
+            d = fetch_json("https://www.virustotal.com/api/v3/ip_addresses/%s"
+                           % probe, 20, {"x-apikey": key})
+            attrs = (d.get("data") or {}).get("attributes") or {}
+            if attrs:
+                stats = attrs.get("last_analysis_stats") or {}
+                print("  VIRUSTOTAL_KEY ✅ 有效（恶意 %s/%s 引擎, reputation=%s）"
+                      % (stats.get("malicious") or 0,
+                         sum(int(v or 0) for v in stats.values()),
+                         attrs.get("reputation")))
+            else:
+                err = ((d.get("error") or {}).get("code")) or "无效/网络失败"
+                print("  VIRUSTOTAL_KEY ❌ %s" % err)
+        print("=" * 60)
+        return 0
+
+    args = list(argv)
+    proxy = None
+    if "--via" in args:
+        pos = args.index("--via")
+        if pos + 1 < len(args):
+            raw = args[pos + 1].strip()
+            proxy = raw if "://" in raw else "socks5h://" + raw
+            del args[pos:pos + 2]
+        else:
+            del args[pos]
+            sys.stderr.write("--via 后面要跟代理地址，例如 socks5://127.0.0.1:10808\n")
+            return 2
+
+    ip = args[0].strip()
+    skip_dnsbl = "--no-dnsbl" in args
+    as_json = "--json" in args
+    is_v6 = ":" in ip
+
+    # 先挡掉内网/保留地址：这类地址查不出任何东西，白耗 API 额度，
+    # 更糟的是各库会返回「无记录」，看起来像「很干净」，给出一个假分数。
+    special = _special_scope(ip)
+    if special:
+        if as_json:
+            print(json.dumps({"ip": ip, "applicable": False,
+                              "error": special}, ensure_ascii=False, indent=2))
+        else:
+            print("IP 质量速查：%s" % ip)
+            print("=" * 68)
+            print("  不适用：%s" % special)
+            print("  该地址不在公网可路由范围，数据源与黑名单都不会有它的记录，")
+            print("  因此不计算评分（否则会得到「无记录 = 干净」的假结论）。")
+            print("=" * 68)
+        return 2
+    # 并发拉取所有数据源
+    tasks = [src_ip2location, src_ipapi_com, src_proxycheck, src_scamalytics,
+             src_greynoise]
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(fn, ip) for fn in tasks]
+        futures.append(pool.submit(src_iplocation_keyed, ip))
+        for fut in futures:
+            try:
+                value = fut.result()
+            except Exception:
+                value = None
+            if isinstance(value, list):
+                results.extend(value)
+            elif value:
+                results.append(value)
+
+    intel = []
+    intel_fns = [intel_shodan, intel_blocklistde, intel_stopforumspam,
+                 intel_sans, intel_otx, intel_virustotal, intel_pdns]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for item in pool.map(lambda fn: fn(ip), intel_fns):
+            if item:
+                intel.append(item)
+
+    blocks = [] if "--no-blocks" in argv else scan_blocks(ip)
+
+    # 地理/归属：取第一个有效值
+    geo = ("—", "—", "—")
+    org = "—"
+    ptr = None
+    for src in results:
+        g = src.get("_geo")
+        if g and g[0] and geo[0] == "—":
+            geo = tuple(x or "—" for x in g)
+        if org == "—" and src.get("_org"):
+            org = str(src["_org"])
+        if not ptr and src.get("_ptr"):
+            ptr = src["_ptr"]
+    if org == "—":
+        info = fetch_json("https://ipinfo.io/%s/json" % ip)
+        org = info.get("org") or "—"
+        if geo[0] == "—" and info.get("country"):
+            geo = (info.get("country"), info.get("region") or "—",
+                   info.get("city") or "—")
+        ptr = ptr or info.get("hostname")
+
+    dnsbl = None
+    if is_v6:
+        dnsbl = {"skipped": "IPv6 不适用（官方库仅支持 IPv4 反查）"}
+    elif skip_dnsbl:
+        dnsbl = {"skipped": "已跳过（--no-dnsbl）"}
+    else:
+        zones = load_zones()
+        dnsbl = dnsbl_report(ip, zones) if zones else {"error": "列表下载失败"}
+
+    score = None
+    try:
+        score = ipscore.evaluate(ip, org, ptr, results, intel, dnsbl, blocks)
+    except Exception as exc:                       # 评分失败不能拖垮整份报告
+        score = {"error": str(exc)}
+
+    platforms = None
+    if score and "severity" in score:
+        try:
+            platforms = iprisk.assess(score["severity"], score["dimensions"])
+        except Exception:
+            platforms = None
+
+    # 实测放最后：要额外几十秒，而且必须拿到真实出口才有意义
+    probe = ipprobe.run(ip, proxy) if proxy else None
+
+    payload = {
+        "ip": ip,
+        "org": org,
+        "country": geo[0], "region": geo[1], "city": geo[2],
+        "ptr": ptr,
+        "score": score,
+        "platforms": platforms,
+        "probe": probe,
+        "sources": [{k: v for k, v in s.items() if not k.startswith("_")}
+                    for s in results],
+        "dnsbl": dnsbl,
+        "blocks": blocks,
+        "intel": [{k: v for k, v in i.items() if not k.startswith("_")}
+                  for i in intel],
+        "missing_key_sources": [k for k, v in KEYS.items() if not v],
+    }
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if "--brief" in argv:
+        if score and "score" in score:
+            print("%s  %3d/%s %-4s 置信度%3d%%  %s"
+                  % (pad(ip, 16), score["score"], score["grade"],
+                     score["grade_cn"], score["confidence"], score["verdict"]))
+        else:
+            print("%s  评分失败：%s" % (pad(ip, 16), (score or {}).get("error")))
+        return 0
+
+    # ---- 文本报告
+    print("IP 质量速查：%s" % ip)
+    print("=" * 68)
+    print("      %s   %s" % (pad("归属", 10), org))
+    print("      %s   %s / %s / %s" % (pad("位置", 10), geo[0], geo[1], geo[2]))
+    if ptr:
+        print("      %s   %s" % (pad("反向解析", 10), ptr))
+
+    if score and "score" in score:
+        _print_score(score)
+    elif score:
+        print()
+        print("【综合评分】 计算失败：%s" % score.get("error"))
+
+    if platforms:
+        _print_platforms(platforms)
+
+    judged = [s for s in results
+              if s.get("proxy") is not None or s.get("tor") is not None
+              or s.get("score") is not None]
+    print()
+    print("【风险因子交叉比对】%d 个库" % len(results))
+    print("  " + pad("库", 16) + pad("代理/VPN", 10) + pad("类型", 14)
+          + pad("Tor", 5) + pad("机房", 5) + pad("移动", 6) + pad("扫描", 6)
+          + "评分")
+    print("  " + "-" * 74)
+    for s in results:
+        sc = "—"
+        if s.get("score") is not None:
+            sc = "%s" % s["score"]
+            if s.get("_abuse") is True:
+                sc += " ⚑滥用"
+            elif s.get("_reports"):
+                sc += " (%s报)" % s["_reports"]
+        if s.get("_err"):
+            scan = "限流"
+        elif s.get("_riot") is True:
+            scan = "良性"
+        elif s.get("_noise") is not None:
+            scan = tri(s.get("_noise"))
+        else:
+            scan = "—"
+        print("  " + pad(s["name"][:16], 16) + pad(tri(s.get("proxy")), 10)
+              + pad((s.get("_rtype") or "—")[:14], 14)
+              + pad(tri(s.get("tor")), 5) + pad(tri(s.get("hosting")), 5)
+              + pad(tri(s.get("mobile")), 6) + pad(scan, 6) + sc)
+
+    gaps = [s for s in results if s.get("_err")]
+    if gaps:
+        print("  数据缺口：%s —— 该项不计分，只降低置信度"
+              % "；".join("%s %s" % (g["name"], g["_err"]) for g in gaps))
+
+    proxy_votes = [s for s in results if s.get("proxy") is True]
+    tor_votes = [s for s in results if s.get("tor") is True]
+    datacenter_votes = [s for s in results if s.get("hosting") is True]
+    voters = [s for s in results if s.get("proxy") is not None]
+
+    print()
+    if proxy_votes:
+        detail = "、".join(s["name"] + ((" " + s["_rtype"]) if s.get("_rtype") else "")
+                          for s in proxy_votes)
+        print("代理判定：  ⚠ %d/%d 个库判定为代理 —— %s"
+              % (len(proxy_votes), len(voters), detail))
+    elif voters:
+        print("代理判定：  否（%d 个库一致判定非代理）" % len(voters))
+    else:
+        print("代理判定：  —（无可用判定源）")
+    if tor_votes:
+        print("Tor：       ⚠ %d 个库判定为 Tor 出口" % len(tor_votes))
+    if datacenter_votes:
+        print("机房 IP：   ⚠ %d 个库判定为数据中心/托管段" % len(datacenter_votes))
+
+    vt = next((i for i in intel if i["name"] == "VirusTotal"), None)
+    if vt and vt.get("_tags"):
+        flagged_tags = [t for t in vt["_tags"]
+                        if t in ("vpn", "proxy", "tor", "anonymous",
+                                 "exit-node", "c2", "malware", "phishing")]
+        if flagged_tags:
+            print("VT 标签：   ⚠ %s（语料库类别标签，独立于引擎判定）"
+                  % "、".join(flagged_tags))
+
+    gn = next((s for s in results if s["name"] == "GreyNoise"), None)
+    if gn and gn.get("_noise") is True:
+        print("主动行为：  ⚠ GreyNoise 观测到主动扫描（分类 %s，最近 %s）"
+              % (gn.get("_class") or "unknown", gn.get("_last") or "未知"))
+    elif gn and gn.get("_riot") is True:
+        print("主动行为：  良性服务（GreyNoise RIOT，公共 DNS/CDN 类）")
+    elif gn and gn.get("_noise") is False:
+        print("主动行为：  未观测到扫描行为（GreyNoise 无记录）")
+
+    if "skipped" in dnsbl:
+        print("黑名单：    %s" % dnsbl["skipped"])
+    elif "error" in dnsbl:
+        print("黑名单：    %s" % dnsbl["error"])
+    else:
+        print("黑名单：    %d 库 | 正常 %d | 已标记 %d | 黑名单 %d"
+              % (dnsbl["total"], dnsbl["clean"], dnsbl["other"],
+                 dnsbl["blacklisted"]))
+        if dnsbl.get("suspect"):
+            print("            （另有 %d 条疑似误报已剔除：该库对 8.8.8.8/1.1.1.1 同样命中）"
+                  % dnsbl["suspect"])
+        for hit in dnsbl.get("hits", [])[:8]:
+            if hit.get("suspect"):
+                tag = "疑似误报"
+            else:
+                tag = "黑名单" if hit["verdict"] == "blacklisted" else "已标记"
+            print("            · %-30s %s -> %s"
+                  % (hit["zone"], tag, ",".join(hit["answer"])))
+
+    if blocks:
+        hits = [b for b in blocks if b["state"] == "hit"]
+        down = [b for b in blocks if b["state"] == "unavailable"]
+        cat_cn = {"blacklist": "恶意/滥用", "proxy": "代理段",
+                  "tor": "Tor 出口", "cloud": "机房段"}
+        print("静态名单：  %d 个（本地缓存，不耗 API 额度）" % len(blocks))
+        if hits:
+            for b in hits:
+                extra = ""
+                if b.get("detail") is not None:
+                    if b["name"] == "IPsum":
+                        extra = "被 %s 个黑名单收录" % b["detail"]
+                    else:
+                        extra = "%s %s" % (b.get("kind") or "", b["detail"])
+                else:
+                    extra = {"tor": "在 Tor 官方出口名单中",
+                             "proxy": "在代理/VPN 精确列表中",
+                             "cloud": "在机房精确列表中"}.get(
+                                 b["cat"], "精确 IP 命中")
+                print("            ⚠ %s %s" % (pad(b["name"][:15], 17),
+                                              extra.strip()))
+        else:
+            print("            未命中任何名单")
+        parts = []
+        for cat in ("blacklist", "proxy", "tor", "cloud"):
+            members = [b for b in blocks if b["cat"] == cat]
+            if not members:
+                continue
+            hit = sum(1 for b in members if b["state"] == "hit")
+            parts.append("%s %d/%d" % (cat_cn[cat], hit, len(members)))
+        print("            分类命中：%s" % " | ".join(parts))
+        if down:
+            print("            不可用：%s" % "、".join(b["name"] for b in down))
+
+    print()
+    keyed = 1 if any(i["name"] == "VirusTotal" for i in intel) else 0
+    print("【威胁情报】%d 源（记录事实型口径%s）"
+          % (len(intel), "，含 VirusTotal" if keyed else "，全部免 key"))
+    for item in intel:
+        print("  %s%s %s" % ("⚠ " if item.get("warn") else "  ",
+                             pad(item["name"][:15], 15), item.get("note", "")))
+
+    pd = next((i for i in intel if i.get("name") == "PassiveDNS"), None)
+    if pd and "_recent" in pd:
+        total_all = pd.get("_total") or 0
+        recent = pd.get("_recent") or 0
+        mal = pd.get("_mal_hosts") or []
+        print()
+        print("【出口复用】近期有多少服务共用这个出口")
+        if not recent and not total_all:
+            print("  独享出口 —— 没有域名解析到此，信誉只由自身行为决定")
+        else:
+            if total_all >= 100:
+                level = "高密度共享（CDN / 虚拟主机 / 多用户出口）"
+            elif total_all >= 20:
+                level = "共享出口"
+            elif total_all >= 1:
+                level = "轻度共享"
+            else:
+                level = "基本独享"
+            print("  解析记录累计 %d 条｜近 90 天活跃样本 %d 个 —— 判读：%s"
+                  % (total_all, recent, level))
+            if total_all > 40:
+                print("  （免费层每次返回前 40 条，总数以 VT 累计为准）")
+            if mal:
+                print("  ⚠ 共用域名中被引擎判恶意的 %d 个：%s%s"
+                      % (len(mal), "、".join(mal[:3]),
+                         "…" if len(mal) > 3 else ""))
+                print("    同出口邻居作恶会连累整段出口的风控评级（连坐效应）")
+
+    if score and "usecases" in score:
+        _print_usecases(score["usecases"])
+
+    missing = [k for k in payload["missing_key_sources"]
+               if k in ("ipqualityscore", "abuseipdb", "virustotal")]
+    if missing:
+        print()
+        print("未启用（缺免费 key，可补）：%s  —— 运行 ip_lookup --keys 查看获取方式"
+              % "、".join(missing))
+    if any(s["name"] == "IPQualityScore" for s in results):
+        print()
+        print("注：IPQS 免费层不含住宅代理检测与 connection_type（需 SMB+ 付费档），")
+        print("    其「代理=否」对住宅代理/住宅 SS 节点的证伪力有限。")
+
+    if probe:
+        _print_probe(ip, probe, platforms)
+
+    print("=" * 68)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
