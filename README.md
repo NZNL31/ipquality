@@ -95,6 +95,58 @@ audit/                                          批量体检流水线（见 audi
 - 平台视角是按各平台公开敏感项做的**推断**，不是平台内部评分。
 - IP 纯净度 ≠ 节点可用性。IP 干净只说明不容易被风控拦，能不能连、快不快是另一件事。
 
+
+---
+
+## 在 Linux / 服务器上运行
+
+`compat/` 是纯 Python，不依赖 Windows，服务器上直接用：
+
+```bash
+python3 -m pip install -r requirements.txt   # 主体只需 dnspython
+curl 是 `ip_lookup` 取数据的传输层，Linux 自带
+
+# 单 IP
+python3 compat/ip_lookup 1.2.3.4
+python3 compat/ip_lookup 1.2.3.4 --json
+python3 compat/ip_lookup 1.2.3.4 --no-dnsbl     # 跳过 423 条 DNSBL 反查，快很多
+
+# 批量（audit/ 目录）
+cd audit
+SUB_URL=https://example.com/sub.txt ./run-purity.sh   # 只算纯净度，不出网探节点
+```
+
+`run-purity.sh` 与 `run-purity.cmd` 等价：`curl 订阅 → parse_sub → stage1 →
+batch（可断点续跑）→ collect → purity_report`。`audit/` 里已有 `v2.txt` 时不再下载。
+
+## JSON 输出（给自动化调用）
+
+`compat/ip_lookup <ip> --json` 的结构（字段名稳定，可直接按这个解析）：
+
+```
+顶层： ip  org  country  region  city  ptr
+       score      <- 对象，见下
+       platforms  probe  sources  dnsbl  blocks  intel  missing_key_sources
+
+score：  score      0-100 的整数
+         grade      A/B/C/D/E
+         grade_cn   等级中文说明
+         confidence 0-100，数据源覆盖度（缺 key/限流时会降低）
+         verdict    一句话结论
+         dimensions 各维度得分与依据
+         usecases   分场景（登录/支付/流媒体…）的可用性
+         cap        因「强代理特征 / 多引擎判恶意 / 广泛列黑」触发的分数上限
+```
+
+两个容易踩的点：
+
+- **分数不在顶层**：`data["score"]` 是对象，分数是 `data["score"]["score"]`。
+- **没有独立的 asn 字段**：ASN 在 `org` 里（形如 `AS13335 Cloudflare, Inc.`）。
+
+私有/保留地址（10/8、100.64/10、198.18/15 等）不做评分，返回
+`{"applicable": false, "error": "..."}` —— 这类地址在各库里都没有记录，
+硬算会得到「无记录 = 很干净」的假结论。
+
 ## 许可
 
 本项目基于 [xykt/IPQuality](https://github.com/xykt/IPQuality)（AGPL-3.0）改写，
